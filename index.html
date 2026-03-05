@@ -28,7 +28,10 @@
         this.velocity = new THREE.Vector3(0, 0, 0);
         this.droneTilt = new THREE.Vector3(0, 0, 0); // 1:1 visual tilt mapping
         this.droneYaw = 0; // Current Y-axis rotation in radians
-        this.cameraOffset = { distance: 2.0, height: 0.5 }; 
+        
+        // MOVED TO FRONT: Negative distance places it ahead of the drone (First Person View)
+        this.cameraOffset = { distance: -0.15, height: 0.05 }; 
+        
         this.upVector = new THREE.Vector3();
         this.leftUpVector = new THREE.Vector3();
         this.baseVector = new THREE.Vector3(0, 1, 0);
@@ -238,8 +241,8 @@
           this.data.hudSpd.setAttribute('value', `SPD\n${spdStr}`);
         }
 
-        // --- THIRD PERSON CAMERA TRACKING ---
-        // Lock the camera rig directly behind the drone's exhaust
+        // --- FIRST PERSON CAMERA TRACKING ---
+        // Lock the camera rig directly to the nose of the drone
         const dronePos = this.data.drone.object3D.position;
         const rigPos = this.data.rig.object3D.position;
         const rigRot = this.data.rig.object3D.rotation;
