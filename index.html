@@ -104,9 +104,12 @@
         const dzP = wristPose.transform.position.z - pinkyPose.transform.position.z;
         const distPinky = Math.sqrt(dxP*dxP + dyP*dyP + dzP*dzP);
 
-        // Thresholds in meters (6cm closed, 10cm open)
-        const isFist = distIndex < 0.06 && distPinky < 0.06;
-        const isOpen = distIndex > 0.10 && distPinky > 0.10;
+        // Thresholds in meters
+        // Calibrated for human hands. Quest 3 tracks the wrist lower than the physical palm.
+        // A closed fist puts fingertips roughly 8-11cm from the wrist tracking joint.
+        // An open hand extends them to 15-20cm.
+        const isFist = distIndex < 0.11 && distPinky < 0.11;
+        const isOpen = distIndex > 0.15 && distPinky > 0.15;
 
         // --- STATE MACHINE ---
         if (this.state === 'DISARMED' && isFist) {
