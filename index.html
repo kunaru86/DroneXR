@@ -102,96 +102,71 @@
         if (this.state === 'HOVER') this.spinProps(0.3);
         if (this.state === 'FLYING') this.spinProps(0.6 + (this.thrust * 0.4));
 
-        const sceneEl = this.el.sceneEl;
-        if (!sceneEl.is('vr-mode')) return; 
+        // Use A-Frame's abstracted object3D directly. It avoids WebXR initialization race conditions.
+        // This Quat represents the controller's exact orientation in the rig space.
+        const rawQuat = new THREE.Quaternion().copy(this.data.rightController.object3D.quaternion);
 
-        const frame = sceneEl.frame;
-        const renderer = sceneEl.renderer;
-        if (!frame || !renderer.xr.getSession()) return;
-
-        const session = renderer.xr.getSession();
-        const refSpace = renderer.xr.getReferenceSpace();
-
-        // Locate the right physical controller hardware source
-        let rightHandSource = null;
-        for (let source of session.inputSources) {
-          if (source.handedness === 'right' && source.gripSpace) {
-            rightHandSource = source;
-            break;
-          }
+        // Calibrate 'Zero' Center when user hits ARM
+        if (this.needsCalibration) {
+          this.baseQuatInv.copy(rawQuat).invert();
+          this.needsCalibration = false;
         }
 
-        // Process Physical Controller Data
-        if (rightHandSource) {
-          const pose = frame.getPose(rightHandSource.gripSpace, refSpace);
-          if (pose) {
-            // This is the absolute physical rotation of the controller in your living room.
-            // It is completely unaffected by the virtual drone spinning around.
-            const rawQuat = new THREE.Quaternion().copy(pose.transform.orientation);
+        if (this.state === 'ARMED' || this.state === 'FLYING' || this.state === 'HOVER') {
+          
+          // Automatic State switching based on trigger squeeze
+          if (this.thrust > 0.05 && (this.state === 'HOVER' || this.state === 'ARMED')) {
+            this.state = 'FLYING';
+            this.updateHUD('FLYING\nTilt to steer');
+          } else if (this.thrust <= 0.05 && this.state === 'FLYING') {
+            this.state = 'HOVER';
+            this.updateHUD('HOVER\nSqueeze Trigger to fly');
+          }
 
-            // Calibrate 'Zero' Center when user hits ARM
-            if (this.needsCalibration) {
-              this.baseQuatInv.copy(rawQuat).invert();
-              this.needsCalibration = false;
-            }
+          // --- KINEMATICS MATH ---
+          // Calculate rotational deviation from the calibrated 'Zero' center
+          const deltaQuat = new THREE.Quaternion().multiplyQuaternions(this.baseQuatInv, rawQuat);
+          // Convert to Euler using YXZ order to prevent roll/yaw coupling artifacts
+          const deltaEuler = new THREE.Euler().setFromQuaternion(deltaQuat, 'YXZ');
 
-            if (this.state === 'ARMED' || this.state === 'FLYING' || this.state === 'HOVER') {
-              
-              // Automatic State switching based on trigger squeeze
-              if (this.thrust > 0.05 && (this.state === 'HOVER' || this.state === 'ARMED')) {
-                this.state = 'FLYING';
-                this.updateHUD('FLYING\nTilt to steer');
-              } else if (this.thrust <= 0.05 && this.state === 'FLYING') {
-                this.state = 'HOVER';
-                this.updateHUD('HOVER\nSqueeze Trigger to fly');
-              }
+          let ctrlPitch = deltaEuler.x;
+          let ctrlRoll = deltaEuler.z;
 
-              // --- KINEMATICS MATH ---
-              // Calculate rotational deviation from the calibrated 'Zero' center
-              const deltaQuat = new THREE.Quaternion().multiplyQuaternions(this.baseQuatInv, rawQuat);
-              // Convert to Euler using YXZ order to prevent roll/yaw coupling artifacts
-              const deltaEuler = new THREE.Euler().setFromQuaternion(deltaQuat, 'YXZ');
+          // Deadzones to prevent micro-jitters
+          const dz = 0.08;
+          ctrlPitch = Math.abs(ctrlPitch) > dz ? ctrlPitch - Math.sign(ctrlPitch)*dz : 0;
+          ctrlRoll = Math.abs(ctrlRoll) > dz ? ctrlRoll - Math.sign(ctrlRoll)*dz : 0;
 
-              let ctrlPitch = deltaEuler.x;
-              let ctrlRoll = deltaEuler.z;
+          // Map physical tilt to drone flight surfaces
+          let targetPitch = ctrlPitch * 0.85;
+          let targetRoll = ctrlRoll * 0.85;
+          let targetYawVel = ctrlRoll * -1.8; // Twisting right drops Roll(Z) negative -> maps to turning right
 
-              // Deadzones to prevent micro-jitters
-              const dz = 0.08;
-              ctrlPitch = Math.abs(ctrlPitch) > dz ? ctrlPitch - Math.sign(ctrlPitch)*dz : 0;
-              ctrlRoll = Math.abs(ctrlRoll) > dz ? ctrlRoll - Math.sign(ctrlRoll)*dz : 0;
+          // Interpolate visual tilt
+          const tiltLerp = 6.0 * dt; 
+          this.droneTilt.x += (targetPitch - this.droneTilt.x) * tiltLerp;
+          this.droneTilt.z += (targetRoll - this.droneTilt.z) * tiltLerp;
+          this.droneYaw += targetYawVel * dt;
 
-              // Map physical tilt to drone flight surfaces
-              let targetPitch = ctrlPitch * 0.85;
-              let targetRoll = ctrlRoll * 0.85;
-              let targetYawVel = ctrlRoll * -1.8; // Twisting right drops Roll(Z) negative -> maps to turning right
+          this.data.drone.object3D.rotation.x = this.droneTilt.x;
+          this.data.drone.object3D.rotation.z = this.droneTilt.z;
 
-              // Interpolate visual tilt
-              const tiltLerp = 6.0 * dt; 
-              this.droneTilt.x += (targetPitch - this.droneTilt.x) * tiltLerp;
-              this.droneTilt.z += (targetRoll - this.droneTilt.z) * tiltLerp;
-              this.droneYaw += targetYawVel * dt;
+          // Apply Thrust Vectoring
+          if (this.state === 'FLYING') {
+            const maxSpeed = 16.0; 
+            const currentThrust = this.thrust * maxSpeed;
 
-              this.data.drone.object3D.rotation.x = this.droneTilt.x;
-              this.data.drone.object3D.rotation.z = this.droneTilt.z;
+            // Grab the drone's current absolute forward direction (including its visual pitch)
+            const droneQuat = this.data.drone.object3D.quaternion;
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(droneQuat);
 
-              // Apply Thrust Vectoring
-              if (this.state === 'FLYING') {
-                const maxSpeed = 16.0; 
-                const currentThrust = this.thrust * maxSpeed;
-
-                // Grab the drone's current absolute forward direction (including its visual pitch)
-                const droneQuat = this.data.drone.object3D.quaternion;
-                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(droneQuat);
-
-                // Push velocity along the nose vector
-                const targetVel = forward.multiplyScalar(currentThrust);
-                this.velocity.lerp(targetVel, 2.5 * dt); // Momentum smooth
-              } else {
-                // Auto-brake in hover mode
-                this.velocity.lerp(new THREE.Vector3(0,0,0), 3.0 * dt);
-                this.droneTilt.multiplyScalar(0.95); // Auto-level
-              }
-            }
+            // Push velocity along the nose vector
+            const targetVel = forward.multiplyScalar(currentThrust);
+            this.velocity.lerp(targetVel, 2.5 * dt); // Momentum smooth
+          } else {
+            // Auto-brake in hover mode
+            this.velocity.lerp(new THREE.Vector3(0,0,0), 3.0 * dt);
+            this.droneTilt.multiplyScalar(0.95); // Auto-level
           }
         }
 
