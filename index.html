@@ -2,8 +2,8 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Operator's Hand-Tracked Drone Sim</title>
-  <!-- A-Frame 1.5.0 is required for stable WebXR hand tracking on Quest 3 -->
+  <title>Operator's Physical Controller Drone Sim</title>
+  <!-- A-Frame 1.5.0 -->
   <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
   
   <script>
@@ -22,11 +22,12 @@
       }
     });
 
-    // Operator's Custom WebXR Hand Tracking Flight Controller
+    // Operator's DJI-Style Motion Controller Matrix
     AFRAME.registerComponent('drone-flight-controller', {
       schema: {
         rig: { type: 'selector', default: '#rig' },
         drone: { type: 'selector', default: '#drone' },
+        rightController: { type: 'selector', default: '#rightHand' },
         hudState: { type: 'selector', default: '#hud-state' },
         hudCompass: { type: 'selector', default: '#hud-compass' },
         hudAlt: { type: 'selector', default: '#hud-alt' },
@@ -35,26 +36,43 @@
       },
 
       init: function () {
-        // Core state machine: DISARMED -> ARMED -> FLYING <-> HOVER
+        // Core state machine: DISARMED -> ARMED <-> FLYING/HOVER
         this.state = 'DISARMED';
         
         // Physics and tracking vectors
         this.velocity = new THREE.Vector3(0, 0, 0);
         this.droneTilt = new THREE.Vector3(0, 0, 0); 
         this.droneYaw = 0; 
+        this.thrust = 0;
         
-        // MOVED TO FRONT: Negative distance places it ahead of the drone (First Person View)
+        // First Person View Offset
         this.cameraOffset = { distance: -0.15, height: 0.05 }; 
         
-        // Virtual Joystick Anchors for Positional Control
-        this.anchorRight = new THREE.Vector3();
-        this.anchorLeft = new THREE.Vector3();
+        // Calibration storage for the physical controller
+        this.baseQuatInv = new THREE.Quaternion();
+        this.needsCalibration = false;
         
-        // Anti-nausea / Anti-acrobatics limits
-        this.maxTilt = 0.35; // Maximum radians the drone is allowed to tilt (approx 20 degrees)
-        this.maxYawSpeed = 0.6; // Severely nerfed yaw speed
+        this.updateHUD('SYSTEM OFFLINE\nPress A button to ARM');
 
-        this.updateHUD('SYSTEM OFFLINE\nMake right fist to ARM');
+        // Hardware Event Listeners
+        const rc = this.data.rightController;
+        
+        // Analog trigger for thrust
+        rc.addEventListener('triggerchanged', (e) => {
+          this.thrust = e.detail.value;
+        });
+
+        // A Button to arm/disarm and set center
+        rc.addEventListener('abuttondown', (e) => {
+          if (this.state === 'DISARMED') {
+            this.state = 'ARMED';
+            this.needsCalibration = true; // Flags the tick loop to grab the physical room orientation
+            this.updateHUD('ARMED\nSqueeze Trigger to FLY');
+          } else {
+            this.state = 'DISARMED';
+            this.updateHUD('SYSTEM OFFLINE\nPress A button to ARM');
+          }
+        });
       },
 
       updateHUD: function(text) {
@@ -79,9 +97,10 @@
         const dt = timeDelta / 1000; 
         if (dt === 0) return;
 
+        // Visual feedback based on state
         if (this.state === 'ARMED') this.spinProps(0.1);
         if (this.state === 'HOVER') this.spinProps(0.3);
-        if (this.state === 'FLYING') this.spinProps(0.6);
+        if (this.state === 'FLYING') this.spinProps(0.6 + (this.thrust * 0.4));
 
         const sceneEl = this.el.sceneEl;
         if (!sceneEl.is('vr-mode')) return; 
@@ -93,154 +112,109 @@
         const session = renderer.xr.getSession();
         const refSpace = renderer.xr.getReferenceSpace();
 
+        // Locate the right physical controller hardware source
         let rightHandSource = null;
-        let leftHandSource = null;
         for (let source of session.inputSources) {
-          if (source.hand) {
-            if (source.handedness === 'right') rightHandSource = source;
-            if (source.handedness === 'left') leftHandSource = source;
+          if (source.handedness === 'right' && source.gripSpace) {
+            rightHandSource = source;
+            break;
           }
         }
 
-        let trackingLost = true;
-        let rightWristPose, indexPose, pinkyPose, leftWristPose;
+        // Process Physical Controller Data
+        if (rightHandSource) {
+          const pose = frame.getPose(rightHandSource.gripSpace, refSpace);
+          if (pose) {
+            // This is the absolute physical rotation of the controller in your living room.
+            // It is completely unaffected by the virtual drone spinning around.
+            const rawQuat = new THREE.Quaternion().copy(pose.transform.orientation);
 
-        if (rightHandSource && leftHandSource) {
-          rightWristPose = frame.getJointPose(rightHandSource.hand.get('wrist'), refSpace);
-          indexPose = frame.getJointPose(rightHandSource.hand.get('index-finger-tip'), refSpace);
-          pinkyPose = frame.getJointPose(rightHandSource.hand.get('pinky-finger-tip'), refSpace);
-          leftWristPose = frame.getJointPose(leftHandSource.hand.get('wrist'), refSpace);
-          
-          if (rightWristPose && indexPose && pinkyPose && leftWristPose) {
-            trackingLost = false;
-          }
-        }
+            // Calibrate 'Zero' Center when user hits ARM
+            if (this.needsCalibration) {
+              this.baseQuatInv.copy(rawQuat).invert();
+              this.needsCalibration = false;
+            }
 
-        if (trackingLost) {
-          if (this.state === 'FLYING') {
-             this.state = 'HOVER';
-             this.updateHUD('TRACKING LOST\nHovering... Show both hands');
-          }
-        } else {
-          // --- GESTURE RECOGNITION (RIGHT FIST MATH) ---
-          const dxI = rightWristPose.transform.position.x - indexPose.transform.position.x;
-          const dyI = rightWristPose.transform.position.y - indexPose.transform.position.y;
-          const dzI = rightWristPose.transform.position.z - indexPose.transform.position.z;
-          const distIndex = Math.sqrt(dxI*dxI + dyI*dyI + dzI*dzI);
+            if (this.state === 'ARMED' || this.state === 'FLYING' || this.state === 'HOVER') {
+              
+              // Automatic State switching based on trigger squeeze
+              if (this.thrust > 0.05 && (this.state === 'HOVER' || this.state === 'ARMED')) {
+                this.state = 'FLYING';
+                this.updateHUD('FLYING\nTilt to steer');
+              } else if (this.thrust <= 0.05 && this.state === 'FLYING') {
+                this.state = 'HOVER';
+                this.updateHUD('HOVER\nSqueeze Trigger to fly');
+              }
 
-          const dxP = rightWristPose.transform.position.x - pinkyPose.transform.position.x;
-          const dyP = rightWristPose.transform.position.y - pinkyPose.transform.position.y;
-          const dzP = rightWristPose.transform.position.z - pinkyPose.transform.position.z;
-          const distPinky = Math.sqrt(dxP*dxP + dyP*dyP + dzP*dzP);
+              // --- KINEMATICS MATH ---
+              // Calculate rotational deviation from the calibrated 'Zero' center
+              const deltaQuat = new THREE.Quaternion().multiplyQuaternions(this.baseQuatInv, rawQuat);
+              // Convert to Euler using YXZ order to prevent roll/yaw coupling artifacts
+              const deltaEuler = new THREE.Euler().setFromQuaternion(deltaQuat, 'YXZ');
 
-          const isFist = distIndex < 0.11 && distPinky < 0.11;
-          const isOpen = distIndex > 0.15 && distPinky > 0.15;
+              let ctrlPitch = deltaEuler.x;
+              let ctrlRoll = deltaEuler.z;
 
-          // --- STATE MACHINE ---
-          if (this.state === 'DISARMED' && isFist) {
-            this.state = 'ARMED';
-            this.updateHUD('ARMED\nHold hands still and open to FLY');
-          } else if (this.state === 'ARMED' && isOpen) {
-            this.state = 'FLYING';
-            // SET ANCHORS! We read the position the moment the hand opens.
-            this.anchorRight.copy(rightWristPose.transform.position);
-            this.anchorLeft.copy(leftWristPose.transform.position);
-            this.updateHUD('FLYING\nPush/Pull relative to anchor to move');
-          } else if (this.state === 'FLYING' && isFist) {
-            this.state = 'DISARMED'; 
-            this.updateHUD('EMERGENCY STOP\nDisarmed');
-          } else if (this.state === 'HOVER') {
-            if (isOpen) {
-              this.state = 'FLYING';
-              // Reset anchors to prevent sudden lurching when tracking returns
-              this.anchorRight.copy(rightWristPose.transform.position);
-              this.anchorLeft.copy(leftWristPose.transform.position);
-              this.updateHUD('FLYING\nTracking restored.');
-            } else if (isFist) {
-              this.state = 'DISARMED';
-              this.updateHUD('SYSTEM OFFLINE\nMake right fist to ARM');
+              // Deadzones to prevent micro-jitters
+              const dz = 0.08;
+              ctrlPitch = Math.abs(ctrlPitch) > dz ? ctrlPitch - Math.sign(ctrlPitch)*dz : 0;
+              ctrlRoll = Math.abs(ctrlRoll) > dz ? ctrlRoll - Math.sign(ctrlRoll)*dz : 0;
+
+              // Map physical tilt to drone flight surfaces
+              let targetPitch = ctrlPitch * 0.85;
+              let targetRoll = ctrlRoll * 0.85;
+              let targetYawVel = ctrlRoll * -1.8; // Twisting right drops Roll(Z) negative -> maps to turning right
+
+              // Interpolate visual tilt
+              const tiltLerp = 6.0 * dt; 
+              this.droneTilt.x += (targetPitch - this.droneTilt.x) * tiltLerp;
+              this.droneTilt.z += (targetRoll - this.droneTilt.z) * tiltLerp;
+              this.droneYaw += targetYawVel * dt;
+
+              this.data.drone.object3D.rotation.x = this.droneTilt.x;
+              this.data.drone.object3D.rotation.z = this.droneTilt.z;
+
+              // Apply Thrust Vectoring
+              if (this.state === 'FLYING') {
+                const maxSpeed = 16.0; 
+                const currentThrust = this.thrust * maxSpeed;
+
+                // Grab the drone's current absolute forward direction (including its visual pitch)
+                const droneQuat = this.data.drone.object3D.quaternion;
+                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(droneQuat);
+
+                // Push velocity along the nose vector
+                const targetVel = forward.multiplyScalar(currentThrust);
+                this.velocity.lerp(targetVel, 2.5 * dt); // Momentum smooth
+              } else {
+                // Auto-brake in hover mode
+                this.velocity.lerp(new THREE.Vector3(0,0,0), 3.0 * dt);
+                this.droneTilt.multiplyScalar(0.95); // Auto-level
+              }
             }
           }
-
-          // --- FLIGHT KINEMATICS: POSITIONAL DISPLACEMENT ---
-          if (this.state === 'FLYING') {
-            let curRight = rightWristPose.transform.position;
-            let curLeft = leftWristPose.transform.position;
-
-            // Calculate positional delta from the invisible anchor points
-            let dRightZ = curRight.z - this.anchorRight.z; // Push forward is negative Z
-            let dRightX = curRight.x - this.anchorRight.x; // Right is positive X
-            let dLeftY  = curLeft.y - this.anchorLeft.y;   // Up is positive Y
-            let dLeftX  = curLeft.x - this.anchorLeft.x;   // Left is negative X
-
-            const posDeadzone = 0.04; // 4cm deadzone around anchor to allow for hand resting
-            const posSensitivity = 12.0; // Multiplier: hand distance -> drone speed
-
-            // Apply deadzones to eliminate micro-jitters
-            let tz = Math.abs(dRightZ) > posDeadzone ? dRightZ + (dRightZ > 0 ? -posDeadzone : posDeadzone) : 0;
-            let tx = Math.abs(dRightX) > posDeadzone ? dRightX + (dRightX > 0 ? -posDeadzone : posDeadzone) : 0;
-            let ty = Math.abs(dLeftY) > posDeadzone ? dLeftY + (dLeftY > 0 ? -posDeadzone : posDeadzone) : 0;
-            let tyaw = Math.abs(dLeftX) > posDeadzone ? dLeftX + (dLeftX > 0 ? -posDeadzone : posDeadzone) : 0;
-
-            // Map deltas to velocities
-            let targetLocalVZ = tz * posSensitivity;
-            let targetLocalVX = tx * posSensitivity;
-            let targetVY = ty * posSensitivity * 0.7; // Slightly less sensitive thrust
-            let targetYawVelocity = -tyaw * this.maxYawSpeed; // Nerfed yaw
-
-            // Clamp max speed to keep things sane
-            const maxSpeed = 6.0; 
-            targetLocalVZ = Math.max(-maxSpeed, Math.min(maxSpeed, targetLocalVZ));
-            targetLocalVX = Math.max(-maxSpeed, Math.min(maxSpeed, targetLocalVX));
-            targetVY = Math.max(-maxSpeed, Math.min(maxSpeed, targetVY));
-
-            // Visual tilt is proportional to speed
-            let targetPitch = targetLocalVZ * 0.1; 
-            let targetRoll = -targetLocalVX * 0.1; 
-
-            // CLAMP ACROBATICS: Drone cannot pitch or roll beyond safe parameters
-            targetPitch = Math.max(-this.maxTilt, Math.min(this.maxTilt, targetPitch));
-            targetRoll = Math.max(-this.maxTilt, Math.min(this.maxTilt, targetRoll));
-
-            // Smooth interpolation
-            const lerpFactor = 4.0 * dt; 
-            this.droneTilt.x += (targetPitch - this.droneTilt.x) * lerpFactor;
-            this.droneTilt.z += (targetRoll - this.droneTilt.z) * lerpFactor;
-            this.velocity.y += (targetVY - this.velocity.y) * lerpFactor;
-            
-            this.droneYaw += targetYawVelocity * dt;
-            this.data.drone.object3D.rotation.x = this.droneTilt.x;
-            this.data.drone.object3D.rotation.z = this.droneTilt.z;
-
-            // Use the actual velocity for translation, not the visually clamped tilt
-            let localVZ = targetLocalVZ;
-            let localVX = targetLocalVX;
-
-            // Global conversion based on Yaw
-            const cosY = Math.cos(this.droneYaw);
-            const sinY = Math.sin(this.droneYaw);
-            
-            this.velocity.x = (localVX * cosY) + (localVZ * sinY);
-            this.velocity.z = -(localVX * sinY) + (localVZ * cosY);
-          }
         }
 
-        if (this.state !== 'FLYING') {
+        // Apply physical gravity/braking if completely disarmed
+        if (this.state === 'DISARMED') {
           this.droneTilt.multiplyScalar(0.9);
-          this.velocity.multiplyScalar(0.9);
+          this.velocity.lerp(new THREE.Vector3(0,-4,0), 2.0 * dt); // Fall out of sky
           this.data.drone.object3D.rotation.x = this.droneTilt.x; 
           this.data.drone.object3D.rotation.z = this.droneTilt.z; 
         }
 
+        // Move the drone body
         this.data.drone.object3D.position.x += this.velocity.x * dt;
         this.data.drone.object3D.position.y += this.velocity.y * dt;
         this.data.drone.object3D.position.z += this.velocity.z * dt;
 
+        // Hard floor collision
         if (this.data.drone.object3D.position.y < 0.1) {
           this.data.drone.object3D.position.y = 0.1;
           if (this.velocity.y < 0) this.velocity.y = 0;
         }
 
+        // Update Yaw mesh
         this.data.drone.object3D.rotation.y = this.droneYaw;
 
         // --- TELEMETRY DATA PUSH TO HUD ---
@@ -273,18 +247,16 @@
 </head>
 <body>
   <!-- Dark synthwave/abstract background and deep fog -->
-  <a-scene webxr="optionalFeatures: hand-tracking;" drone-flight-controller background="color: #030308" fog="type: exponential; color: #030308; density: 0.025">
+  <a-scene drone-flight-controller background="color: #030308" fog="type: exponential; color: #030308; density: 0.025">
     
-    <!-- Giant wireframe floor to give a sense of global speed and scale -->
+    <!-- Giant wireframe floor -->
     <a-plane rotation="-90 0 0" width="400" height="400" color="#00ffff" wireframe="true" opacity="0.15"></a-plane>
 
     <!-- ABSTRACT FLOATING GEOMETRY GARDEN -->
-    
     <!-- Platform 1: Central Hub -->
     <a-entity position="0 4 -12" oscillate="speed: 1.2; amount: 0.8; offset: 0">
       <a-cylinder segments-radial="6" radius="4" height="0.4" color="#111" wireframe="false"></a-cylinder>
       <a-cylinder segments-radial="6" radius="4.1" height="0.45" color="#00ffff" wireframe="true"></a-cylinder>
-      <!-- Plant 1: Spinning Icosahedron core -->
       <a-icosahedron color="#ff00ff" wireframe="true" radius="1.2" position="0 2 0" animation="property: rotation; to: 0 360 0; loop: true; dur: 8000; easing: linear"></a-icosahedron>
       <a-octahedron color="#00ffff" opacity="0.5" radius="0.5" position="0 2 0" animation="property: rotation; to: 360 0 360; loop: true; dur: 4000; easing: linear"></a-octahedron>
     </a-entity>
@@ -293,7 +265,6 @@
     <a-entity position="12 8 -25" oscillate="speed: 0.8; amount: 1.5; offset: 2.5">
       <a-cylinder segments-radial="6" radius="3" height="0.4" color="#111" wireframe="false"></a-cylinder>
       <a-cylinder segments-radial="6" radius="3.1" height="0.45" color="#00ffaa" wireframe="true"></a-cylinder>
-      <!-- Plant 2: Stacked angular crystal -->
       <a-cone radius-bottom="0.8" radius-top="0" segments-radial="4" height="2" color="#00ffaa" wireframe="true" position="0 1 0"></a-cone>
       <a-cone radius-bottom="0" radius-top="0.8" segments-radial="4" height="2" color="#00ffaa" wireframe="true" position="0 3 0"></a-cone>
     </a-entity>
@@ -302,7 +273,6 @@
     <a-entity position="-15 5 -20" oscillate="speed: 1.5; amount: 0.6; offset: 1.2">
       <a-cylinder segments-radial="6" radius="5" height="0.4" color="#111" wireframe="false"></a-cylinder>
       <a-cylinder segments-radial="6" radius="5.1" height="0.45" color="#ff00ff" wireframe="true"></a-cylinder>
-      <!-- Plant 3: Dodecahedron cluster -->
       <a-dodecahedron color="#ff00ff" wireframe="true" radius="1.5" position="0 1.5 0" animation="property: rotation; to: -360 360 0; loop: true; dur: 12000; easing: linear"></a-dodecahedron>
       <a-dodecahedron color="#00ffff" wireframe="true" radius="0.8" position="2 1 2" animation="property: rotation; to: 0 360 360; loop: true; dur: 6000; easing: linear"></a-dodecahedron>
       <a-dodecahedron color="#00ffaa" wireframe="true" radius="1.0" position="-2 2 -1" animation="property: rotation; to: 360 0 -360; loop: true; dur: 9000; easing: linear"></a-dodecahedron>
@@ -318,25 +288,18 @@
 
     <!-- The Drone Entity -->
     <a-entity id="drone" position="0 1.5 -2">
-      <!-- Core Body -->
       <a-box color="#222" width="0.2" height="0.08" depth="0.2"></a-box>
-      <!-- Front Indicator (so you know which way is forward) -->
       <a-box color="#00ffaa" width="0.2" height="0.02" depth="0.05" position="0 0.04 -0.1"></a-box>
 
-      <!-- Arms and Propellers -->
-      <!-- Front Left -->
       <a-cylinder color="#555" radius="0.01" height="0.2" position="-0.15 0 -0.15" rotation="90 45 0"></a-cylinder>
       <a-cylinder class="propeller" color="#aaa" radius="0.1" height="0.005" position="-0.22 0.03 -0.22" opacity="0.8"></a-cylinder>
       
-      <!-- Front Right -->
       <a-cylinder color="#555" radius="0.01" height="0.2" position="0.15 0 -0.15" rotation="90 -45 0"></a-cylinder>
       <a-cylinder class="propeller" color="#aaa" radius="0.1" height="0.005" position="0.22 0.03 -0.22" opacity="0.8"></a-cylinder>
 
-      <!-- Back Left -->
       <a-cylinder color="#555" radius="0.01" height="0.2" position="-0.15 0 0.15" rotation="90 -45 0"></a-cylinder>
       <a-cylinder class="propeller" color="#aaa" radius="0.1" height="0.005" position="-0.22 0.03 0.22" opacity="0.8"></a-cylinder>
 
-      <!-- Back Right -->
       <a-cylinder color="#555" radius="0.01" height="0.2" position="0.15 0 0.15" rotation="90 45 0"></a-cylinder>
       <a-cylinder class="propeller" color="#aaa" radius="0.1" height="0.005" position="0.22 0.03 0.22" opacity="0.8"></a-cylinder>
     </a-entity>
@@ -349,66 +312,24 @@
         
         <!-- J.A.R.V.I.S. Style Tactical HUD -->
         <a-entity id="iron-man-hud" position="0 0 -0.8">
-          
-          <!-- Center Reticle -->
           <a-ring color="#00ffff" radius-inner="0.03" radius-outer="0.035" opacity="0.6"></a-ring>
           <a-ring color="#00ffff" radius-inner="0.08" radius-outer="0.082" opacity="0.3" theta-length="60" theta-start="60"></a-ring>
           <a-ring color="#00ffff" radius-inner="0.08" radius-outer="0.082" opacity="0.3" theta-length="60" theta-start="240"></a-ring>
           <a-circle color="#ff3333" radius="0.003" opacity="0.8"></a-circle>
 
-          <!-- Framing Lines -->
           <a-entity line="start: -0.4 0.3 0; end: 0.4 0.3 0; color: #00ffff; opacity: 0.3"></a-entity>
           <a-entity line="start: -0.4 -0.3 0; end: 0.4 -0.3 0; color: #00ffff; opacity: 0.3"></a-entity>
 
-          <!-- Top: Compass / Heading -->
-          <a-text id="hud-compass" 
-                  position="0 0.32 0" 
-                  value="HDG [ 000 ]" 
-                  align="center" 
-                  width="1.2" 
-                  color="#00ffff" 
-                  font="monoid"
-                  opacity="0.9">
-          </a-text>
-
-          <!-- Right: Altitude -->
-          <a-text id="hud-alt" 
-                  position="0.45 0 0" 
-                  value="ALT\n0.0m" 
-                  align="center" 
-                  width="1.2" 
-                  color="#00ffff" 
-                  font="monoid"
-                  opacity="0.9">
-          </a-text>
-
-          <!-- Left: Speed -->
-          <a-text id="hud-spd" 
-                  position="-0.45 0 0" 
-                  value="SPD\n0.0" 
-                  align="center" 
-                  width="1.2" 
-                  color="#00ffff" 
-                  font="monoid"
-                  opacity="0.9">
-          </a-text>
-
-          <!-- Bottom: State Warnings -->
-          <a-text id="hud-state" 
-                  position="0 -0.35 0" 
-                  value="INITIALIZING..." 
-                  align="center" 
-                  width="0.9" 
-                  color="#ff3333" 
-                  font="monoid">
-          </a-text>
-
+          <a-text id="hud-compass" position="0 0.32 0" value="HDG [ 000 ]" align="center" width="1.2" color="#00ffff" font="monoid" opacity="0.9"></a-text>
+          <a-text id="hud-alt" position="0.45 0 0" value="ALT\n0.0m" align="center" width="1.2" color="#00ffff" font="monoid" opacity="0.9"></a-text>
+          <a-text id="hud-spd" position="-0.45 0 0" value="SPD\n0.0" align="center" width="1.2" color="#00ffff" font="monoid" opacity="0.9"></a-text>
+          <a-text id="hud-state" position="0 -0.35 0" value="INITIALIZING..." align="center" width="0.9" color="#ff3333" font="monoid"></a-text>
         </a-entity>
       </a-camera>
 
-      <!-- Hand Models -->
-      <a-entity id="leftHand" hand-tracking-controls="hand: left; modelColor: #00ffff;"></a-entity>
-      <a-entity id="rightHand" hand-tracking-controls="hand: right; modelColor: #00ffff;"></a-entity>
+      <!-- Physical Controller Models -->
+      <a-entity id="leftHand" oculus-touch-controls="hand: left; model: true;"></a-entity>
+      <a-entity id="rightHand" oculus-touch-controls="hand: right; model: true;"></a-entity>
 
     </a-entity>
 
