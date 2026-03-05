@@ -13,7 +13,10 @@
       schema: {
         rig: { type: 'selector', default: '#rig' },
         drone: { type: 'selector', default: '#drone' },
-        hud: { type: 'selector', default: '#hud' },
+        hudState: { type: 'selector', default: '#hud-state' },
+        hudCompass: { type: 'selector', default: '#hud-compass' },
+        hudAlt: { type: 'selector', default: '#hud-alt' },
+        hudSpd: { type: 'selector', default: '#hud-spd' },
         props: { type: 'selectorAll', default: '.propeller' }
       },
 
@@ -23,7 +26,7 @@
         
         // Physics and tracking vectors to avoid garbage collection stutters
         this.velocity = new THREE.Vector3(0, 0, 0);
-        this.localVelocity = new THREE.Vector3(0, 0, 0); // Used for relative pitch/roll
+        this.droneTilt = new THREE.Vector3(0, 0, 0); // 1:1 visual tilt mapping
         this.droneYaw = 0; // Current Y-axis rotation in radians
         this.cameraOffset = { distance: 2.0, height: 0.5 }; 
         this.upVector = new THREE.Vector3();
@@ -31,18 +34,18 @@
         this.baseVector = new THREE.Vector3(0, 1, 0);
         this.wristQuat = new THREE.Quaternion();
 
-        this.updateHUD('DISARMED\nMake a right fist to ARM');
+        this.updateHUD('SYSTEM OFFLINE\nMake right fist to ARM');
       },
 
       updateHUD: function(text) {
-        if (this.data.hud) {
-          this.data.hud.setAttribute('value', text);
+        if (this.data.hudState) {
+          this.data.hudState.setAttribute('value', text);
           
           // Color coding for organic readability
-          if(this.state === 'DISARMED') this.data.hud.setAttribute('color', '#ff3333');
-          if(this.state === 'ARMED') this.data.hud.setAttribute('color', '#ffaa00');
-          if(this.state === 'FLYING') this.data.hud.setAttribute('color', '#00ff00');
-          if(this.state === 'HOVER') this.data.hud.setAttribute('color', '#00aaff');
+          if(this.state === 'DISARMED') this.data.hudState.setAttribute('color', '#ff3333');
+          if(this.state === 'ARMED') this.data.hudState.setAttribute('color', '#ffaa00');
+          if(this.state === 'FLYING') this.data.hudState.setAttribute('color', '#00ffff');
+          if(this.state === 'HOVER') this.data.hudState.setAttribute('color', '#00aaff');
         }
       },
 
@@ -86,7 +89,7 @@
         let trackingLost = true;
         let rightWristPose, indexPose, pinkyPose, leftWristPose;
 
-        // We now require both hands for full 6DOF flight
+        // We require both hands for full 6DOF flight
         if (rightHandSource && leftHandSource) {
           rightWristPose = frame.getJointPose(rightHandSource.hand.get('wrist'), refSpace);
           indexPose = frame.getJointPose(rightHandSource.hand.get('index-finger-tip'), refSpace);
@@ -139,91 +142,112 @@
             }
           }
 
-          // --- FLIGHT KINEMATICS & STABILITY ---
+          // --- FLIGHT KINEMATICS: 1-to-1 IMMERSIVE MAPPING ---
           if (this.state === 'FLYING') {
-            // RIGHT HAND: Pitch (Z) and Roll (X)
+            // Extract Hand Vectors
             this.wristQuat.copy(rightWristPose.transform.orientation);
             this.upVector.copy(this.baseVector).applyQuaternion(this.wristQuat);
 
-            // LEFT HAND: Thrust (Y) and Yaw (Rotation Y)
             this.wristQuat.copy(leftWristPose.transform.orientation);
             this.leftUpVector.copy(this.baseVector).applyQuaternion(this.wristQuat);
 
-            const maxSpeed = 6.0; 
-            const maxYawSpeed = 2.0; // Radians per second
-            const deadzone = 0.15; 
+            const tiltSensitivity = 1.2; 
+            const maxSpeed = 8.0; 
+            const maxYawSpeed = 2.0; 
+            const deadzone = 0.1; 
 
-            // Left hand inputs
-            let targetVY = this.leftUpVector.z * maxSpeed; // Tilt L hand up/down for altitude
-            let targetYawVelocity = -this.leftUpVector.x * maxYawSpeed; // Tilt L hand left/right to yaw
+            // --- LEFT HAND (THROTTLE & YAW) ---
+            // Tilt fingers UP (positive Z) to ascend. Tilt DOWN (negative Z) to descend.
+            let targetVY = this.leftUpVector.z * maxSpeed; 
+            // Roll hand left (negative X) to yaw left. Roll right to yaw right.
+            let targetYawVelocity = -this.leftUpVector.x * maxYawSpeed; 
 
-            // Right hand inputs
-            let targetLocalVZ = this.upVector.z * maxSpeed;
-            let targetLocalVX = this.upVector.x * maxSpeed;
+            // --- RIGHT HAND (PITCH & ROLL) ---
+            // Map right hand tilt directly to drone tilt target
+            let targetPitch = this.upVector.z * tiltSensitivity; // Forward/back
+            let targetRoll = -this.upVector.x * tiltSensitivity; // Left/right
 
             // Apply deadzones
             if (Math.abs(targetVY) < deadzone) targetVY = 0;
             if (Math.abs(targetYawVelocity) < deadzone) targetYawVelocity = 0;
-            if (Math.abs(targetLocalVZ) < deadzone) targetLocalVZ = 0;
-            if (Math.abs(targetLocalVX) < deadzone) targetLocalVX = 0;
+            if (Math.abs(targetPitch) < deadzone) targetPitch = 0;
+            if (Math.abs(targetRoll) < deadzone) targetRoll = 0;
 
-            // Exponential moving average for stability
-            const lerpFactor = 3.0 * dt; 
-            this.localVelocity.z += (targetLocalVZ - this.localVelocity.z) * lerpFactor;
-            this.localVelocity.x += (targetLocalVX - this.localVelocity.x) * lerpFactor;
+            // Smooth interpolation for visual tilt (removes biological jitter)
+            const lerpFactor = 5.0 * dt; 
+            this.droneTilt.x += (targetPitch - this.droneTilt.x) * lerpFactor;
+            this.droneTilt.z += (targetRoll - this.droneTilt.z) * lerpFactor;
             this.velocity.y += (targetVY - this.velocity.y) * lerpFactor;
             
-            // Update Yaw
+            // Apply rotations
             this.droneYaw += targetYawVelocity * dt;
+            this.data.drone.object3D.rotation.x = this.droneTilt.x;
+            this.data.drone.object3D.rotation.z = this.droneTilt.z;
 
-            // Visual tilt (Pitch and Roll relative to drone)
-            this.data.drone.object3D.rotation.x = this.localVelocity.z * 0.1;
-            this.data.drone.object3D.rotation.z = -this.localVelocity.x * 0.1;
+            // Generate Local Velocity directly from the Drone's actual visual tilt
+            // This guarantees the movement matches what you see 1:1.
+            let localVZ = this.droneTilt.x * maxSpeed;
+            let localVX = -this.droneTilt.z * maxSpeed;
+
+            // Convert Local X/Z to Global Velocity based on Drone's Yaw direction
+            const cosY = Math.cos(this.droneYaw);
+            const sinY = Math.sin(this.droneYaw);
+            
+            this.velocity.x = (localVX * cosY) + (localVZ * sinY);
+            this.velocity.z = -(localVX * sinY) + (localVZ * cosY);
+
           }
         }
 
-        // Apply physics regardless of state 
+        // Decelerate and level out if hovering or disarmed
         if (this.state !== 'FLYING') {
-          this.localVelocity.multiplyScalar(0.9);
-          this.velocity.y *= 0.9;
-          this.data.drone.object3D.rotation.x = 0; 
-          this.data.drone.object3D.rotation.z = 0; 
+          this.droneTilt.multiplyScalar(0.9);
+          this.velocity.multiplyScalar(0.9);
+          this.data.drone.object3D.rotation.x = this.droneTilt.x; 
+          this.data.drone.object3D.rotation.z = this.droneTilt.z; 
         }
 
-        // Convert Local Z/X to Global Velocity using Trigonometry based on current Yaw
-        const cosY = Math.cos(this.droneYaw);
-        const sinY = Math.sin(this.droneYaw);
-        
-        this.velocity.x = (this.localVelocity.x * cosY) + (this.localVelocity.z * sinY);
-        this.velocity.z = -(this.localVelocity.x * sinY) + (this.localVelocity.z * cosY);
-
-        // Apply final velocity to drone position
+        // Apply final velocity to global position
         this.data.drone.object3D.position.x += this.velocity.x * dt;
         this.data.drone.object3D.position.y += this.velocity.y * dt;
         this.data.drone.object3D.position.z += this.velocity.z * dt;
 
-        // Hard floor collision (I assume you don't want to mine for coal)
+        // Hard floor collision (The ground is lava... and solid)
         if (this.data.drone.object3D.position.y < 0.1) {
           this.data.drone.object3D.position.y = 0.1;
           if (this.velocity.y < 0) this.velocity.y = 0;
         }
 
-        // Apply global yaw rotation to drone
+        // Apply global yaw rotation to drone mesh
         this.data.drone.object3D.rotation.y = this.droneYaw;
 
+        // --- TELEMETRY DATA PUSH TO HUD ---
+        if (this.data.hudCompass && this.data.hudAlt && this.data.hudSpd) {
+          // Calculate heading (0-359 degrees)
+          let headingDegrees = -(this.droneYaw * 180 / Math.PI) % 360;
+          if (headingDegrees < 0) headingDegrees += 360;
+          let hdgStr = Math.round(headingDegrees).toString().padStart(3, '0');
+          this.data.hudCompass.setAttribute('value', `HDG [ ${hdgStr} ]`);
+
+          // Calculate Altitude
+          let altStr = this.data.drone.object3D.position.y.toFixed(1);
+          this.data.hudAlt.setAttribute('value', `ALT\n${altStr}m`);
+
+          // Calculate Speed (Magnitude of velocity vector)
+          let spdStr = this.velocity.length().toFixed(1);
+          this.data.hudSpd.setAttribute('value', `SPD\n${spdStr}`);
+        }
+
         // --- THIRD PERSON CAMERA TRACKING ---
-        // Orbit the camera rig to stay behind the drone based on its Yaw
+        // Lock the camera rig directly behind the drone's exhaust
         const dronePos = this.data.drone.object3D.position;
         const rigPos = this.data.rig.object3D.position;
         const rigRot = this.data.rig.object3D.rotation;
         
-        // Calculate point exactly 2 meters behind the drone's current facing direction
         const targetRigX = dronePos.x + Math.sin(this.droneYaw) * this.cameraOffset.distance;
         const targetRigZ = dronePos.z + Math.cos(this.droneYaw) * this.cameraOffset.distance;
         
         rigPos.set(targetRigX, dronePos.y + this.cameraOffset.height, targetRigZ);
-        
-        // Rotate the VR rig to face the drone
         rigRot.set(0, this.droneYaw, 0);
       }
     });
@@ -275,21 +299,69 @@
       
       <!-- Camera / Head -->
       <a-camera id="head" position="0 1.6 0">
-        <!-- HUD locked to the user's face -->
-        <a-text id="hud" 
-                position="0 -0.3 -0.6" 
-                value="WAITING FOR VR" 
-                align="center" 
-                width="0.8" 
-                color="#fff"
-                font="monoid"
-                wrap-count="30">
-        </a-text>
+        
+        <!-- J.A.R.V.I.S. Style Tactical HUD -->
+        <a-entity id="iron-man-hud" position="0 0 -0.8">
+          
+          <!-- Center Reticle -->
+          <a-ring color="#00ffff" radius-inner="0.03" radius-outer="0.035" opacity="0.6"></a-ring>
+          <a-ring color="#00ffff" radius-inner="0.08" radius-outer="0.082" opacity="0.3" theta-length="60" theta-start="60"></a-ring>
+          <a-ring color="#00ffff" radius-inner="0.08" radius-outer="0.082" opacity="0.3" theta-length="60" theta-start="240"></a-ring>
+          <a-circle color="#ff3333" radius="0.003" opacity="0.8"></a-circle>
+
+          <!-- Framing Lines -->
+          <a-entity line="start: -0.4 0.3 0; end: 0.4 0.3 0; color: #00ffff; opacity: 0.3"></a-entity>
+          <a-entity line="start: -0.4 -0.3 0; end: 0.4 -0.3 0; color: #00ffff; opacity: 0.3"></a-entity>
+
+          <!-- Top: Compass / Heading -->
+          <a-text id="hud-compass" 
+                  position="0 0.32 0" 
+                  value="HDG [ 000 ]" 
+                  align="center" 
+                  width="1.2" 
+                  color="#00ffff" 
+                  font="monoid"
+                  opacity="0.9">
+          </a-text>
+
+          <!-- Right: Altitude -->
+          <a-text id="hud-alt" 
+                  position="0.45 0 0" 
+                  value="ALT\n0.0m" 
+                  align="center" 
+                  width="1.2" 
+                  color="#00ffff" 
+                  font="monoid"
+                  opacity="0.9">
+          </a-text>
+
+          <!-- Left: Speed -->
+          <a-text id="hud-spd" 
+                  position="-0.45 0 0" 
+                  value="SPD\n0.0" 
+                  align="center" 
+                  width="1.2" 
+                  color="#00ffff" 
+                  font="monoid"
+                  opacity="0.9">
+          </a-text>
+
+          <!-- Bottom: State Warnings -->
+          <a-text id="hud-state" 
+                  position="0 -0.35 0" 
+                  value="INITIALIZING..." 
+                  align="center" 
+                  width="0.9" 
+                  color="#ff3333" 
+                  font="monoid">
+          </a-text>
+
+        </a-entity>
       </a-camera>
 
       <!-- Hand Models -->
-      <a-entity id="leftHand" hand-tracking-controls="hand: left;"></a-entity>
-      <a-entity id="rightHand" hand-tracking-controls="hand: right; modelColor: #00ffaa;"></a-entity>
+      <a-entity id="leftHand" hand-tracking-controls="hand: left; modelColor: #00ffff;"></a-entity>
+      <a-entity id="rightHand" hand-tracking-controls="hand: right; modelColor: #00ffff;"></a-entity>
 
     </a-entity>
 
