@@ -18,17 +18,20 @@
       },
 
       init: function () {
-        // Core state machine: DISARMED -> ARMED -> FLYING
+        // Core state machine: DISARMED -> ARMED -> FLYING <-> HOVER
         this.state = 'DISARMED';
         
         // Physics and tracking vectors to avoid garbage collection stutters
         this.velocity = new THREE.Vector3(0, 0, 0);
-        this.cameraOffset = new THREE.Vector3(0, 0.5, 2.0); // 2m behind, 0.5m above
+        this.localVelocity = new THREE.Vector3(0, 0, 0); // Used for relative pitch/roll
+        this.droneYaw = 0; // Current Y-axis rotation in radians
+        this.cameraOffset = { distance: 2.0, height: 0.5 }; 
         this.upVector = new THREE.Vector3();
+        this.leftUpVector = new THREE.Vector3();
         this.baseVector = new THREE.Vector3(0, 1, 0);
         this.wristQuat = new THREE.Quaternion();
 
-        this.updateHUD('DISARMED\nMake a fist to ARM');
+        this.updateHUD('DISARMED\nMake a right fist to ARM');
       },
 
       updateHUD: function(text) {
@@ -39,6 +42,7 @@
           if(this.state === 'DISARMED') this.data.hud.setAttribute('color', '#ff3333');
           if(this.state === 'ARMED') this.data.hud.setAttribute('color', '#ffaa00');
           if(this.state === 'FLYING') this.data.hud.setAttribute('color', '#00ff00');
+          if(this.state === 'HOVER') this.data.hud.setAttribute('color', '#00aaff');
         }
       },
 
@@ -55,7 +59,8 @@
 
         // Visual feedback based on state
         if (this.state === 'ARMED') this.spinProps(0.1);
-        if (this.state === 'FLYING') this.spinProps(0.5);
+        if (this.state === 'HOVER') this.spinProps(0.3);
+        if (this.state === 'FLYING') this.spinProps(0.6);
 
         // Access raw WebXR session to bypass A-Frame's abstraction lag
         const sceneEl = this.el.sceneEl;
@@ -68,133 +73,184 @@
         const session = renderer.xr.getSession();
         const refSpace = renderer.xr.getReferenceSpace();
 
-        // Locate the right hand input source
+        // Locate both hand input sources
         let rightHandSource = null;
+        let leftHandSource = null;
         for (let source of session.inputSources) {
-          if (source.hand && source.handedness === 'right') {
-            rightHandSource = source;
-            break;
+          if (source.hand) {
+            if (source.handedness === 'right') rightHandSource = source;
+            if (source.handedness === 'left') leftHandSource = source;
           }
         }
 
-        if (!rightHandSource) {
-          if (this.state !== 'DISARMED') {
-             this.state = 'DISARMED';
-             this.updateHUD('TRACKING LOST\nDisarmed');
-          }
-          return;
-        }
+        let trackingLost = true;
+        let rightWristPose, indexPose, pinkyPose, leftWristPose;
 
-        // --- GESTURE RECOGNITION (FIST MATH) ---
-        // Get raw joint poses for wrist, index tip, and pinky tip
-        const wristPose = frame.getJointPose(rightHandSource.hand.get('wrist'), refSpace);
-        const indexPose = frame.getJointPose(rightHandSource.hand.get('index-finger-tip'), refSpace);
-        const pinkyPose = frame.getJointPose(rightHandSource.hand.get('pinky-finger-tip'), refSpace);
-
-        if (!wristPose || !indexPose || !pinkyPose) return;
-
-        // Calculate distance from wrist to fingertips
-        const dxI = wristPose.transform.position.x - indexPose.transform.position.x;
-        const dyI = wristPose.transform.position.y - indexPose.transform.position.y;
-        const dzI = wristPose.transform.position.z - indexPose.transform.position.z;
-        const distIndex = Math.sqrt(dxI*dxI + dyI*dyI + dzI*dzI);
-
-        const dxP = wristPose.transform.position.x - pinkyPose.transform.position.x;
-        const dyP = wristPose.transform.position.y - pinkyPose.transform.position.y;
-        const dzP = wristPose.transform.position.z - pinkyPose.transform.position.z;
-        const distPinky = Math.sqrt(dxP*dxP + dyP*dyP + dzP*dzP);
-
-        // Thresholds in meters
-        // Calibrated for human hands. Quest 3 tracks the wrist lower than the physical palm.
-        // A closed fist puts fingertips roughly 8-11cm from the wrist tracking joint.
-        // An open hand extends them to 15-20cm.
-        const isFist = distIndex < 0.11 && distPinky < 0.11;
-        const isOpen = distIndex > 0.15 && distPinky > 0.15;
-
-        // --- STATE MACHINE ---
-        if (this.state === 'DISARMED' && isFist) {
-          this.state = 'ARMED';
-          this.updateHUD('ARMED\nOpen hand to FLY');
-        } else if (this.state === 'ARMED' && isOpen) {
-          this.state = 'FLYING';
-          this.updateHUD('FLYING\nTilt hand to move. Fist to stop.');
-        } else if (this.state === 'FLYING' && isFist) {
-          this.state = 'DISARMED'; // Emergency kill switch
-          this.updateHUD('EMERGENCY STOP\nDisarmed');
-        }
-
-        // --- FLIGHT KINEMATICS ---
-        if (this.state === 'FLYING') {
-          // Extract the wrist orientation to determine hand tilt
-          this.wristQuat.copy(wristPose.transform.orientation);
+        // We now require both hands for full 6DOF flight
+        if (rightHandSource && leftHandSource) {
+          rightWristPose = frame.getJointPose(rightHandSource.hand.get('wrist'), refSpace);
+          indexPose = frame.getJointPose(rightHandSource.hand.get('index-finger-tip'), refSpace);
+          pinkyPose = frame.getJointPose(rightHandSource.hand.get('pinky-finger-tip'), refSpace);
+          leftWristPose = frame.getJointPose(leftHandSource.hand.get('wrist'), refSpace);
           
-          // Apply quaternion to a standard 'up' vector (back of the hand)
-          this.upVector.copy(this.baseVector).applyQuaternion(this.wristQuat);
-
-          // Map vector axes to drone velocity. 
-          // Note: In WebXR, hand orientations can vary slightly, but generally 
-          // tilting forward changes the Z of the back-of-hand normal, tilting sideways changes X.
-          const maxSpeed = 5.0; // meters per second
-          const deadzone = 0.1;
-
-          // Z-axis of normal controls forward/back
-          let targetVZ = this.upVector.z * maxSpeed;
-          // X-axis of normal controls left/right strafe
-          let targetVX = this.upVector.x * maxSpeed;
-
-          // Apply deadzone so minor twitches don't cause drift
-          if (Math.abs(targetVZ) < deadzone) targetVZ = 0;
-          if (Math.abs(targetVX) < deadzone) targetVX = 0;
-
-          // Smooth velocity transition (acceleration/momentum)
-          this.velocity.z += (targetVZ - this.velocity.z) * 0.05;
-          this.velocity.x += (targetVX - this.velocity.x) * 0.05;
-
-          // Apply velocity to drone
-          this.data.drone.object3D.position.x += this.velocity.x * dt;
-          this.data.drone.object3D.position.z += this.velocity.z * dt;
-
-          // Tilt drone model visually based on velocity
-          this.data.drone.object3D.rotation.x = this.velocity.z * 0.1;
-          this.data.drone.object3D.rotation.z = -this.velocity.x * 0.1;
-        } else {
-          // Decelerate if not flying
-          this.velocity.multiplyScalar(0.9);
-          this.data.drone.object3D.position.x += this.velocity.x * dt;
-          this.data.drone.object3D.position.z += this.velocity.z * dt;
-          this.data.drone.object3D.rotation.set(0,0,0);
+          if (rightWristPose && indexPose && pinkyPose && leftWristPose) {
+            trackingLost = false;
+          }
         }
+
+        // --- TRACKING LOSS FAILSAFE (HOVER MODE) ---
+        if (trackingLost) {
+          if (this.state === 'FLYING') {
+             this.state = 'HOVER';
+             this.updateHUD('TRACKING LOST\nHovering... Show both hands');
+          }
+        } else {
+          // --- GESTURE RECOGNITION (RIGHT FIST MATH) ---
+          const dxI = rightWristPose.transform.position.x - indexPose.transform.position.x;
+          const dyI = rightWristPose.transform.position.y - indexPose.transform.position.y;
+          const dzI = rightWristPose.transform.position.z - indexPose.transform.position.z;
+          const distIndex = Math.sqrt(dxI*dxI + dyI*dyI + dzI*dzI);
+
+          const dxP = rightWristPose.transform.position.x - pinkyPose.transform.position.x;
+          const dyP = rightWristPose.transform.position.y - pinkyPose.transform.position.y;
+          const dzP = rightWristPose.transform.position.z - pinkyPose.transform.position.z;
+          const distPinky = Math.sqrt(dxP*dxP + dyP*dyP + dzP*dzP);
+
+          const isFist = distIndex < 0.11 && distPinky < 0.11;
+          const isOpen = distIndex > 0.15 && distPinky > 0.15;
+
+          // --- STATE MACHINE ---
+          if (this.state === 'DISARMED' && isFist) {
+            this.state = 'ARMED';
+            this.updateHUD('ARMED\nOpen right hand to FLY');
+          } else if (this.state === 'ARMED' && isOpen) {
+            this.state = 'FLYING';
+            this.updateHUD('FLYING\nL: Thrust/Yaw | R: Pitch/Roll');
+          } else if (this.state === 'FLYING' && isFist) {
+            this.state = 'DISARMED'; 
+            this.updateHUD('EMERGENCY STOP\nDisarmed');
+          } else if (this.state === 'HOVER') {
+            if (isOpen) {
+              this.state = 'FLYING';
+              this.updateHUD('FLYING\nTracking restored.');
+            } else if (isFist) {
+              this.state = 'DISARMED';
+              this.updateHUD('DISARMED\nMake right fist to ARM');
+            }
+          }
+
+          // --- FLIGHT KINEMATICS & STABILITY ---
+          if (this.state === 'FLYING') {
+            // RIGHT HAND: Pitch (Z) and Roll (X)
+            this.wristQuat.copy(rightWristPose.transform.orientation);
+            this.upVector.copy(this.baseVector).applyQuaternion(this.wristQuat);
+
+            // LEFT HAND: Thrust (Y) and Yaw (Rotation Y)
+            this.wristQuat.copy(leftWristPose.transform.orientation);
+            this.leftUpVector.copy(this.baseVector).applyQuaternion(this.wristQuat);
+
+            const maxSpeed = 6.0; 
+            const maxYawSpeed = 2.0; // Radians per second
+            const deadzone = 0.15; 
+
+            // Left hand inputs
+            let targetVY = this.leftUpVector.z * maxSpeed; // Tilt L hand up/down for altitude
+            let targetYawVelocity = -this.leftUpVector.x * maxYawSpeed; // Tilt L hand left/right to yaw
+
+            // Right hand inputs
+            let targetLocalVZ = this.upVector.z * maxSpeed;
+            let targetLocalVX = this.upVector.x * maxSpeed;
+
+            // Apply deadzones
+            if (Math.abs(targetVY) < deadzone) targetVY = 0;
+            if (Math.abs(targetYawVelocity) < deadzone) targetYawVelocity = 0;
+            if (Math.abs(targetLocalVZ) < deadzone) targetLocalVZ = 0;
+            if (Math.abs(targetLocalVX) < deadzone) targetLocalVX = 0;
+
+            // Exponential moving average for stability
+            const lerpFactor = 3.0 * dt; 
+            this.localVelocity.z += (targetLocalVZ - this.localVelocity.z) * lerpFactor;
+            this.localVelocity.x += (targetLocalVX - this.localVelocity.x) * lerpFactor;
+            this.velocity.y += (targetVY - this.velocity.y) * lerpFactor;
+            
+            // Update Yaw
+            this.droneYaw += targetYawVelocity * dt;
+
+            // Visual tilt (Pitch and Roll relative to drone)
+            this.data.drone.object3D.rotation.x = this.localVelocity.z * 0.1;
+            this.data.drone.object3D.rotation.z = -this.localVelocity.x * 0.1;
+          }
+        }
+
+        // Apply physics regardless of state 
+        if (this.state !== 'FLYING') {
+          this.localVelocity.multiplyScalar(0.9);
+          this.velocity.y *= 0.9;
+          this.data.drone.object3D.rotation.x = 0; 
+          this.data.drone.object3D.rotation.z = 0; 
+        }
+
+        // Convert Local Z/X to Global Velocity using Trigonometry based on current Yaw
+        const cosY = Math.cos(this.droneYaw);
+        const sinY = Math.sin(this.droneYaw);
+        
+        this.velocity.x = (this.localVelocity.x * cosY) + (this.localVelocity.z * sinY);
+        this.velocity.z = -(this.localVelocity.x * sinY) + (this.localVelocity.z * cosY);
+
+        // Apply final velocity to drone position
+        this.data.drone.object3D.position.x += this.velocity.x * dt;
+        this.data.drone.object3D.position.y += this.velocity.y * dt;
+        this.data.drone.object3D.position.z += this.velocity.z * dt;
+
+        // Hard floor collision (I assume you don't want to mine for coal)
+        if (this.data.drone.object3D.position.y < 0.1) {
+          this.data.drone.object3D.position.y = 0.1;
+          if (this.velocity.y < 0) this.velocity.y = 0;
+        }
+
+        // Apply global yaw rotation to drone
+        this.data.drone.object3D.rotation.y = this.droneYaw;
 
         // --- THIRD PERSON CAMERA TRACKING ---
-        // Force the entire rig (camera + hands) to follow the drone
+        // Orbit the camera rig to stay behind the drone based on its Yaw
         const dronePos = this.data.drone.object3D.position;
         const rigPos = this.data.rig.object3D.position;
+        const rigRot = this.data.rig.object3D.rotation;
         
-        // Target rig position is behind and above the drone
-        const targetX = dronePos.x + this.cameraOffset.x;
-        const targetY = dronePos.y + this.cameraOffset.y;
-        const targetZ = dronePos.z + this.cameraOffset.z;
-
-        // Strict follow - no interpolation on Z/X to prevent the drone drifting away from the camera
-        // In third person VR, keeping the relationship locked reduces visual desync.
-        rigPos.set(targetX, targetY, targetZ);
+        // Calculate point exactly 2 meters behind the drone's current facing direction
+        const targetRigX = dronePos.x + Math.sin(this.droneYaw) * this.cameraOffset.distance;
+        const targetRigZ = dronePos.z + Math.cos(this.droneYaw) * this.cameraOffset.distance;
+        
+        rigPos.set(targetRigX, dronePos.y + this.cameraOffset.height, targetRigZ);
+        
+        // Rotate the VR rig to face the drone
+        rigRot.set(0, this.droneYaw, 0);
       }
     });
   </script>
 </head>
 <body>
-  <!-- Scene with Hand Tracking enabled in WebXR -->
-  <a-scene webxr="optionalFeatures: hand-tracking;" drone-flight-controller background="color: #87CEEB">
+  <a-scene webxr="optionalFeatures: hand-tracking;" drone-flight-controller background="color: #000000">
     
-    <!-- Procedural Landscape -->
-    <a-entity environment="preset: default; groundColor: #445; grid: none; dressingAmount: 100"></a-entity>
+    <!-- Upgraded Training Environment -->
+    <a-entity environment="preset: contact; groundColor: #112; grid: 1x1; dressingAmount: 60"></a-entity>
+
+    <!-- Training Course Rings -->
+    <a-entity id="training-course">
+      <a-torus position="0 1.5 -8" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 0 0" opacity="0.8"></a-torus>
+      <a-torus position="0 2.5 -16" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 0 0" opacity="0.8"></a-torus>
+      <a-torus position="3 2.0 -24" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 30 0" opacity="0.8"></a-torus>
+      <a-torus position="8 1.5 -30" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 60 0" opacity="0.8"></a-torus>
+      <a-torus position="15 3.0 -32" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 90 0" opacity="0.8"></a-torus>
+      <a-torus position="22 2.0 -28" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 120 0" opacity="0.8"></a-torus>
+    </a-entity>
 
     <!-- The Drone Entity -->
     <a-entity id="drone" position="0 1.5 -2">
       <!-- Core Body -->
-      <a-box color="#333" width="0.2" height="0.08" depth="0.2"></a-box>
+      <a-box color="#222" width="0.2" height="0.08" depth="0.2"></a-box>
       <!-- Front Indicator (so you know which way is forward) -->
-      <a-box color="#f00" width="0.2" height="0.02" depth="0.05" position="0 0.04 -0.1"></a-box>
+      <a-box color="#00ffaa" width="0.2" height="0.02" depth="0.05" position="0 0.04 -0.1"></a-box>
 
       <!-- Arms and Propellers -->
       <!-- Front Left -->
@@ -233,7 +289,7 @@
 
       <!-- Hand Models -->
       <a-entity id="leftHand" hand-tracking-controls="hand: left;"></a-entity>
-      <a-entity id="rightHand" hand-tracking-controls="hand: right; modelColor: #44aa44;"></a-entity>
+      <a-entity id="rightHand" hand-tracking-controls="hand: right; modelColor: #00ffaa;"></a-entity>
 
     </a-entity>
 
