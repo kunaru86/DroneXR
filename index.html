@@ -5,9 +5,23 @@
   <title>Operator's Hand-Tracked Drone Sim</title>
   <!-- A-Frame 1.5.0 is required for stable WebXR hand tracking on Quest 3 -->
   <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
-  <!-- Environment component for a basic landscape -->
-  <script src="https://unpkg.com/aframe-environment-component@1.3.3/dist/aframe-environment-component.min.js"></script>
+  
   <script>
+    // Component to make platforms and objects float up and down
+    AFRAME.registerComponent('oscillate', {
+      schema: {
+        speed: {type: 'number', default: 1},
+        amount: {type: 'number', default: 0.5},
+        offset: {type: 'number', default: 0}
+      },
+      init: function() { 
+        this.baseY = this.el.object3D.position.y; 
+      },
+      tick: function(time) {
+        this.el.object3D.position.y = this.baseY + Math.sin(time / 1000 * this.data.speed + this.data.offset) * this.data.amount;
+      }
+    });
+
     // Operator's Custom WebXR Hand Tracking Flight Controller
     AFRAME.registerComponent('drone-flight-controller', {
       schema: {
@@ -258,19 +272,48 @@
   </script>
 </head>
 <body>
-  <a-scene webxr="optionalFeatures: hand-tracking;" drone-flight-controller background="color: #000000">
+  <!-- Dark synthwave/abstract background and deep fog -->
+  <a-scene webxr="optionalFeatures: hand-tracking;" drone-flight-controller background="color: #030308" fog="type: exponential; color: #030308; density: 0.025">
     
-    <!-- Upgraded Training Environment -->
-    <a-entity environment="preset: contact; groundColor: #112; grid: 1x1; dressingAmount: 60"></a-entity>
+    <!-- Giant wireframe floor to give a sense of global speed and scale -->
+    <a-plane rotation="-90 0 0" width="400" height="400" color="#00ffff" wireframe="true" opacity="0.15"></a-plane>
 
-    <!-- Training Course Rings -->
+    <!-- ABSTRACT FLOATING GEOMETRY GARDEN -->
+    
+    <!-- Platform 1: Central Hub -->
+    <a-entity position="0 4 -12" oscillate="speed: 1.2; amount: 0.8; offset: 0">
+      <a-cylinder segments-radial="6" radius="4" height="0.4" color="#111" wireframe="false"></a-cylinder>
+      <a-cylinder segments-radial="6" radius="4.1" height="0.45" color="#00ffff" wireframe="true"></a-cylinder>
+      <!-- Plant 1: Spinning Icosahedron core -->
+      <a-icosahedron color="#ff00ff" wireframe="true" radius="1.2" position="0 2 0" animation="property: rotation; to: 0 360 0; loop: true; dur: 8000; easing: linear"></a-icosahedron>
+      <a-octahedron color="#00ffff" opacity="0.5" radius="0.5" position="0 2 0" animation="property: rotation; to: 360 0 360; loop: true; dur: 4000; easing: linear"></a-octahedron>
+    </a-entity>
+
+    <!-- Platform 2: High Right -->
+    <a-entity position="12 8 -25" oscillate="speed: 0.8; amount: 1.5; offset: 2.5">
+      <a-cylinder segments-radial="6" radius="3" height="0.4" color="#111" wireframe="false"></a-cylinder>
+      <a-cylinder segments-radial="6" radius="3.1" height="0.45" color="#00ffaa" wireframe="true"></a-cylinder>
+      <!-- Plant 2: Stacked angular crystal -->
+      <a-cone radius-bottom="0.8" radius-top="0" segments-radial="4" height="2" color="#00ffaa" wireframe="true" position="0 1 0"></a-cone>
+      <a-cone radius-bottom="0" radius-top="0.8" segments-radial="4" height="2" color="#00ffaa" wireframe="true" position="0 3 0"></a-cone>
+    </a-entity>
+
+    <!-- Platform 3: Low Left -->
+    <a-entity position="-15 5 -20" oscillate="speed: 1.5; amount: 0.6; offset: 1.2">
+      <a-cylinder segments-radial="6" radius="5" height="0.4" color="#111" wireframe="false"></a-cylinder>
+      <a-cylinder segments-radial="6" radius="5.1" height="0.45" color="#ff00ff" wireframe="true"></a-cylinder>
+      <!-- Plant 3: Dodecahedron cluster -->
+      <a-dodecahedron color="#ff00ff" wireframe="true" radius="1.5" position="0 1.5 0" animation="property: rotation; to: -360 360 0; loop: true; dur: 12000; easing: linear"></a-dodecahedron>
+      <a-dodecahedron color="#00ffff" wireframe="true" radius="0.8" position="2 1 2" animation="property: rotation; to: 0 360 360; loop: true; dur: 6000; easing: linear"></a-dodecahedron>
+      <a-dodecahedron color="#00ffaa" wireframe="true" radius="1.0" position="-2 2 -1" animation="property: rotation; to: 360 0 -360; loop: true; dur: 9000; easing: linear"></a-dodecahedron>
+    </a-entity>
+
+    <!-- Angular Training Rings (Octagonal) -->
     <a-entity id="training-course">
-      <a-torus position="0 1.5 -8" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 0 0" opacity="0.8"></a-torus>
-      <a-torus position="0 2.5 -16" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 0 0" opacity="0.8"></a-torus>
-      <a-torus position="3 2.0 -24" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 30 0" opacity="0.8"></a-torus>
-      <a-torus position="8 1.5 -30" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 60 0" opacity="0.8"></a-torus>
-      <a-torus position="15 3.0 -32" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 90 0" opacity="0.8"></a-torus>
-      <a-torus position="22 2.0 -28" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 120 0" opacity="0.8"></a-torus>
+      <a-torus position="0 1.5 -6" radius="1.2" tube="0.05" segments-tubular="8" color="#00ffaa" rotation="0 0 0" opacity="0.8"></a-torus>
+      <a-torus position="5 4.0 -18" radius="1.5" tube="0.05" segments-tubular="8" color="#ff00ff" rotation="0 -30 0" opacity="0.8"></a-torus>
+      <a-torus position="-8 6.0 -28" radius="1.5" tube="0.05" segments-tubular="8" color="#00ffff" rotation="0 45 0" opacity="0.8"></a-torus>
+      <a-torus position="10 9.0 -40" radius="2.0" tube="0.05" segments-tubular="8" color="#00ffaa" rotation="0 -60 0" opacity="0.8"></a-torus>
     </a-entity>
 
     <!-- The Drone Entity -->
